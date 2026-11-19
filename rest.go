@@ -22,8 +22,12 @@ import (
 
 const scopesValue = "repo, read:org"
 
+var scopesHeaderMap = map[string]string{"x-oauth-scopes": scopesValue}
+
+// scopesHeaders returns the shared read-only scopes header map. Callers
+// must not mutate it (withLink copies when it needs to add a Link).
 func scopesHeaders() map[string]string {
-	return map[string]string{"x-oauth-scopes": scopesValue}
+	return scopesHeaderMap
 }
 
 // ---------------------------------------------------------------------------
@@ -472,7 +476,12 @@ func paginate[T any](r *http.Request, items []T, query url.Values) ([]T, string)
 
 func withLink(headers map[string]string, link string) map[string]string {
 	if link != "" {
-		headers["link"] = link
+		out := make(map[string]string, len(headers)+1)
+		for k, v := range headers {
+			out[k] = v
+		}
+		out["link"] = link
+		return out
 	}
 	return headers
 }
@@ -780,7 +789,12 @@ func tryServeCachedIssue(w http.ResponseWriter, r *http.Request, store *Store, t
 func routeRest(r *http.Request, store *Store, raw []byte) (restResponse, error) {
 	method := r.Method
 	segments := pathSegments(r)
-	query := r.URL.Query()
+	// Only GET routes read the query string; parsing it (a map build)
+	// for every POST/PATCH/DELETE is wasted work on the write path.
+	var query url.Values
+	if method == http.MethodGet || method == http.MethodHead {
+		query = r.URL.Query()
+	}
 
 	// /api/v3 (root)
 	if len(segments) == 2 && segments[0] == "api" && segments[1] == "v3" {
@@ -975,6 +989,7 @@ func routeRepo(r *http.Request, store *Store, raw []byte, query url.Values, meth
 			return restResponse{}, Err(422, "sha does not exist")
 		}
 		repo.Refs[ref] = sha
+		repo.RefsVersion++
 		return jsonResponse(201, map[string]any{
 			"ref":    ref,
 			"object": map[string]any{"sha": sha, "type": "commit"},

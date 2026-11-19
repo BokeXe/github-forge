@@ -100,6 +100,7 @@ type Repo struct {
 	UpdatedAt     string
 	HeadTarget    string // e.g. "refs/heads/main"
 	Refs          map[string]string
+	RefsVersion   int // bumped on every Refs/HeadTarget change; keys the advertisement caches
 	Objects       map[string]*GitObject
 	Issues        map[int]*Issue
 	Pulls         map[int]*Pull

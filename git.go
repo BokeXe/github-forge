@@ -37,6 +37,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode"
 )
 
@@ -53,7 +54,151 @@ var (
 	gitV2VersionRe = regexp.MustCompile(`(?:^|;)\s*version=2\s*(?:;|$)`)
 )
 
-func gitIsObjectID(value string) bool { return gitHex40Re.MatchString(value) }
+// Manual equivalents of the regexps above for the hot paths (every git
+// request, every pkt-line header, every object id). Semantics identical.
+func gitIsHex40(value string) bool {
+	if len(value) != 40 {
+		return false
+	}
+	for i := 0; i < 40; i++ {
+		c := value[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f') {
+			return false
+		}
+	}
+	return true
+}
+
+func gitIsObjectID(value string) bool { return gitIsHex40(value) }
+
+// gitParseHex4 parses exactly 4 hex digits; ok is false on any non-hex byte.
+func gitParseHex4(b []byte) (int, bool) {
+	if len(b) < 4 {
+		return 0, false
+	}
+	v := 0
+	for i := 0; i < 4; i++ {
+		c := b[i]
+		var d int
+		switch {
+		case c >= '0' && c <= '9':
+			d = int(c - '0')
+		case c >= 'a' && c <= 'f':
+			d = int(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			d = int(c-'A') + 10
+		default:
+			return 0, false
+		}
+		v = v*16 + d
+	}
+	return v, true
+}
+
+const gitHexDigits = "0123456789abcdef"
+
+func gitAppendHex4(out []byte, v int) []byte {
+	return append(out, gitHexDigits[(v>>12)&0xf], gitHexDigits[(v>>8)&0xf], gitHexDigits[(v>>4)&0xf], gitHexDigits[v&0xf])
+}
+
+func gitIsHex4(s string) bool {
+	if len(s) != 4 {
+		return false
+	}
+	for i := 0; i < 4; i++ {
+		c := s[i]
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+func gitIsName(s string) bool {
+	if len(s) == 0 || len(s) > 100 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		alnum := c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' || c >= '0' && c <= '9'
+		if i == 0 {
+			if !alnum {
+				return false
+			}
+		} else if !alnum && c != '.' && c != '_' && c != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+// gitMatchRoute is gitRouteRe without the regexp engine: it returns
+// owner, repo, service for /{owner}/{repo}.git/{service}.
+func gitMatchRoute(path string) (owner, repo, service string, ok bool) {
+	if len(path) < 2 || path[0] != '/' {
+		return "", "", "", false
+	}
+	rest := path[1:]
+	slash := strings.IndexByte(rest, '/')
+	if slash <= 0 {
+		return "", "", "", false
+	}
+	owner = rest[:slash]
+	rest = rest[slash+1:]
+	slash = strings.IndexByte(rest, '/')
+	if slash <= 0 {
+		return "", "", "", false
+	}
+	repoPart := rest[:slash]
+	service = rest[slash+1:]
+	if !strings.HasSuffix(repoPart, ".git") {
+		return "", "", "", false
+	}
+	repo = repoPart[:len(repoPart)-4]
+	if repo == "" {
+		return "", "", "", false
+	}
+	switch service {
+	case "info/refs", "git-upload-pack", "git-receive-pack":
+		return owner, repo, service, true
+	}
+	return "", "", "", false
+}
+
+// gitHeaderWantsV2 is gitV2VersionRe: a `version=2` token bounded by
+// start/semicolon (with optional space) and semicolon/end.
+func gitHeaderWantsV2(header string) bool {
+	for i := 0; i+9 <= len(header); i++ {
+		if header[i:i+9] != "version=2" {
+			continue
+		}
+		// Left boundary: start, or ';' followed by optional spaces.
+		leftOK := false
+		if i == 0 {
+			leftOK = true
+		} else {
+			j := i - 1
+			for j >= 0 && (header[j] == ' ' || header[j] == '\t') {
+				j--
+			}
+			if j >= 0 && header[j] == ';' {
+				leftOK = true
+			}
+		}
+		if !leftOK {
+			continue
+		}
+		// Right boundary: end, or optional spaces then ';'.
+		j := i + 9
+		for j < len(header) && (header[j] == ' ' || header[j] == '\t') {
+			j++
+		}
+		if j >= len(header) || header[j] == ';' {
+			return true
+		}
+	}
+	return false
+}
 
 // ---------------------------------------------------------------------------------------------
 // object ids, deltas, packs
@@ -180,26 +325,40 @@ func gitWritePackObjectHeader(objType string, size int) []byte {
 
 // gitWritePack builds a packfile (version 2) from plain objects, no deltas.
 // The trailer is SHA-1 over everything before it. Objects are deflated with
-// zlib at the default level, matching git.ts's deflateSync(data) (Node's
-// default compression level).
+// zlib at BestSpeed through a pooled writer: pack bytes are not compared
+// byte-for-byte anywhere (clients inflate and verify object hashes), so the
+// compression level is free to favour speed. Pooling matters: a fresh
+// flate writer allocates ~100 KB of window/dictionary state per object.
+var gitZlibWriterPool = sync.Pool{
+	New: func() any {
+		w, _ := zlib.NewWriterLevel(io.Discard, zlib.BestSpeed)
+		return w
+	},
+}
+
 func gitWritePack(objects []*GitObject) []byte {
+	size := 12 + 20
+	for _, object := range objects {
+		size += len(object.Data) + 16
+	}
 	var body bytes.Buffer
+	body.Grow(size)
 	header := make([]byte, 12)
 	copy(header, "PACK")
 	binary.BigEndian.PutUint32(header[4:], 2)
 	binary.BigEndian.PutUint32(header[8:], uint32(len(objects)))
 	body.Write(header)
+	zw := gitZlibWriterPool.Get().(*zlib.Writer)
 	for _, object := range objects {
 		body.Write(gitWritePackObjectHeader(object.Type, len(object.Data)))
-		zw := zlib.NewWriter(&body)
+		zw.Reset(&body)
 		zw.Write(object.Data)
 		zw.Close()
 	}
+	gitZlibWriterPool.Put(zw)
 	trailer := sha1.Sum(body.Bytes())
-	out := make([]byte, 0, body.Len()+len(trailer))
-	out = append(out, body.Bytes()...)
-	out = append(out, trailer[:]...)
-	return out
+	body.Write(trailer[:])
+	return body.Bytes()
 }
 
 type gitPackEntry struct {
@@ -290,14 +449,59 @@ func (c *gitCountingByteReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// Pooled zlib readers: a fresh reader allocates a 32 KiB window plus
+// dictionary state per object inflated (the push workload inflates 3
+// objects per push, 200 pushes a round). Reset re-reads the zlib header
+// from the new counting reader, so the consumed-byte count stays exact.
+var gitEmptyZlibStream = func() []byte {
+	var b bytes.Buffer
+	w := zlib.NewWriter(&b)
+	w.Close()
+	return b.Bytes()
+}()
+
+var gitZlibReaderPool = sync.Pool{
+	New: func() any {
+		r, err := zlib.NewReader(bytes.NewReader(gitEmptyZlibStream))
+		if err != nil {
+			panic(err)
+		}
+		return r
+	},
+}
+
 func gitInflateAt(buffer []byte, offset int) (data []byte, next int, err error) {
+	return gitInflateAtSize(buffer, offset, -1)
+}
+
+// gitInflateAtSize is gitInflateAt with the expected inflated size known
+// (pack entries declare it): the output buffer is allocated exactly once
+// instead of growing through io.ReadAll.
+func gitInflateAtSize(buffer []byte, offset int, size int64) (data []byte, next int, err error) {
 	counter := &gitCountingByteReader{r: bytes.NewReader(buffer[offset:])}
-	zr, zerr := zlib.NewReader(counter)
-	if zerr != nil {
-		return nil, 0, fmt.Errorf("zlib stream at offset %d did not inflate: %s", offset, zerr.Error())
+	zr := gitZlibReaderPool.Get().(io.ReadCloser)
+	resetErr := zr.(zlib.Resetter).Reset(counter, nil)
+	if resetErr != nil {
+		gitZlibReaderPool.Put(zr)
+		return nil, 0, fmt.Errorf("zlib stream at offset %d did not inflate: %s", offset, resetErr.Error())
 	}
-	data, zerr = io.ReadAll(zr)
+	var zerr error
+	if size >= 0 && size <= 512<<20 {
+		data = make([]byte, size)
+		_, zerr = io.ReadFull(zr, data)
+		if zerr == nil {
+			// The stream must end exactly here.
+			var extra [1]byte
+			n, rerr := zr.Read(extra[:])
+			if n != 0 || (rerr != nil && rerr != io.EOF) {
+				zerr = fmt.Errorf("zlib stream has trailing data")
+			}
+		}
+	} else {
+		data, zerr = io.ReadAll(zr)
+	}
 	zr.Close()
+	gitZlibReaderPool.Put(zr)
 	if zerr != nil {
 		return nil, 0, fmt.Errorf("zlib stream at offset %d did not inflate: %s", offset, zerr.Error())
 	}
@@ -373,7 +577,7 @@ func gitParsePack(pack []byte, resolveBase func(oid string) *GitObject, light bo
 		} else if _, ok := gitCodeType[typeCode]; !ok {
 			return nil, fmt.Errorf("pack entry %d has unknown type code %d", index, typeCode)
 		}
-		inflated, n, err := gitInflateAt(packBody, offset)
+		inflated, n, err := gitInflateAtSize(packBody, offset, int64(size))
 		if err != nil {
 			return nil, err
 		}
@@ -938,7 +1142,7 @@ func gitEncodePktLines(items []gitPktItem) ([]byte, error) {
 		case "response-end":
 			out = append(out, "0002"...)
 		default:
-			out = append(out, fmt.Sprintf("%04x", len(item.data)+4)...)
+			out = gitAppendHex4(out, len(item.data)+4)
 			out = append(out, item.data...)
 		}
 	}
@@ -955,23 +1159,6 @@ func gitEncodePktLines(items []gitPktItem) ([]byte, error) {
 // always packs to the same bytes). Bounded to 8 entries per repo. The
 // snapshot is built from sorted refs so the key is deterministic in Go (TS
 // used Map insertion order; the key is internal either way).
-func gitRefsSnapshot(repo *Repo) string {
-	var b strings.Builder
-	b.WriteString(repo.HeadTarget)
-	b.WriteByte('=')
-	if oid, ok := repo.Refs[repo.HeadTarget]; ok {
-		b.WriteString(oid)
-	} else {
-		b.WriteString(gitZeroOID)
-	}
-	for _, ref := range gitSortedRefs(repo) {
-		b.WriteByte(';')
-		b.WriteString(ref.Name)
-		b.WriteByte('=')
-		b.WriteString(ref.OID)
-	}
-	return b.String()
-}
 
 // gitCacheGet reads the cache. Caller must hold store.Mu (read or write).
 func gitCacheGet(repo *Repo, key string) ([]byte, bool) {
@@ -1010,11 +1197,11 @@ func gitDecodePacketsUntilFlush(buffer []byte) (ok bool, packets []gitPacket, co
 		if offset+4 > len(buffer) {
 			return false, packets, offset
 		}
-		header := string(buffer[offset : offset+4])
-		if !gitHex4Re.MatchString(header) {
+		lengthInt, hexOk := gitParseHex4(buffer[offset : offset+4])
+		if !hexOk {
 			return false, packets, offset
 		}
-		length, _ := strconv.ParseInt(header, 16, 64)
+		length := int64(lengthInt)
 		if length == 0 {
 			return true, append(packets, gitPacket{Kind: "flush"}), offset + 4
 		}
@@ -1048,11 +1235,11 @@ func gitDecodePackets(buffer []byte) (ok bool, packets []gitPacket) {
 		if offset+4 > len(buffer) {
 			return false, packets
 		}
-		header := string(buffer[offset : offset+4])
-		if !gitHex4Re.MatchString(header) {
+		lengthInt, hexOk := gitParseHex4(buffer[offset : offset+4])
+		if !hexOk {
 			return false, packets
 		}
-		length, _ := strconv.ParseInt(header, 16, 64)
+		length := int64(lengthInt)
 		if length == 0 {
 			packets = append(packets, gitPacket{Kind: "flush"})
 			offset += 4
@@ -1409,6 +1596,25 @@ func gitBufferResponse(status int, contentType string, body []byte) gitResponse 
 	return gitResponse{status: status, contentType: contentType, body: body}
 }
 
+// gitQueryParam reads one query parameter without building a map.
+// Values are compared literally by callers (service names are plain
+// ASCII), so no percent-decoding is needed here.
+func gitQueryParam(rawQuery, key string) string {
+	for len(rawQuery) > 0 {
+		pair := rawQuery
+		if i := strings.IndexByte(rawQuery, '&'); i >= 0 {
+			pair = rawQuery[:i]
+			rawQuery = rawQuery[i+1:]
+		} else {
+			rawQuery = ""
+		}
+		if eq := strings.IndexByte(pair, '='); eq >= 0 && pair[:eq] == key {
+			return pair[eq+1:]
+		}
+	}
+	return ""
+}
+
 func gitAuthorised(r *http.Request, token string) bool {
 	if token == "" {
 		return true // no token configured (local dev): do not lock the door on nothing
@@ -1417,7 +1623,7 @@ func gitAuthorised(r *http.Request, token string) bool {
 }
 
 func gitWantsV2(r *http.Request) bool {
-	return gitV2VersionRe.MatchString(r.Header.Get("Git-Protocol"))
+	return gitHeaderWantsV2(r.Header.Get("Git-Protocol"))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1432,11 +1638,11 @@ func HandleGit(w http.ResponseWriter, r *http.Request, store *Store, token strin
 	if pathname == "" {
 		pathname = "/"
 	}
-	match := gitRouteRe.FindStringSubmatch(pathname)
-	if match == nil {
+	owner, repoName, service, isGit := gitMatchRoute(pathname)
+	if !isGit {
 		return false
 	}
-	resp := gitServe(r, store, token, match[1], match[2], match[3])
+	resp := gitServe(r, store, token, owner, repoName, service)
 	w.Header().Set("content-type", resp.contentType)
 	w.Header().Set("content-length", strconv.Itoa(len(resp.body)))
 	w.WriteHeader(resp.status)
@@ -1458,7 +1664,7 @@ func gitServe(r *http.Request, store *Store, token, owner, repoName, service str
 	if !gitAuthorised(r, token) {
 		return gitJSONResponse(401, "Unauthorized")
 	}
-	if !gitNameRe.MatchString(owner) || !gitNameRe.MatchString(repoName) {
+	if !gitIsName(owner) || !gitIsName(repoName) {
 		return gitJSONResponse(404, "Not Found")
 	}
 	method := r.Method
@@ -1470,7 +1676,7 @@ func gitServe(r *http.Request, store *Store, token, owner, repoName, service str
 		if method != "GET" {
 			return gitJSONResponse(405, "Method Not Allowed")
 		}
-		queryService := r.URL.Query().Get("service")
+		queryService := gitQueryParam(r.URL.RawQuery, "service")
 		if queryService != "git-upload-pack" && queryService != "git-receive-pack" {
 			return gitJSONResponse(404, "Not Found")
 		}
@@ -1485,7 +1691,7 @@ func gitServe(r *http.Request, store *Store, token, owner, repoName, service str
 			store.Mu.RUnlock()
 			return gitBufferResponse(200, "application/x-"+queryService+"-advertisement", gitV2AdvertisementBytes)
 		}
-		cacheKey := "adv0:" + queryService + ":" + gitRefsSnapshot(repo)
+		cacheKey := "adv0:" + queryService + ":" + strconv.Itoa(repo.RefsVersion)
 		if cached, ok := gitCacheGet(repo, cacheKey); ok {
 			store.Mu.RUnlock()
 			return gitBufferResponse(200, "application/x-"+queryService+"-advertisement", cached)
@@ -1609,7 +1815,7 @@ func gitHandleUploadPack(r *http.Request, store *Store, repo *Repo, body []byte)
 		command := strings.TrimSpace(strings.TrimSuffix(first[len("command="):], "\n"))
 		if command == "ls-refs" {
 			store.Mu.RLock()
-			cacheKey := "ls:" + gitRefsSnapshot(repo) + ":" + strings.Join(lines, "|")
+			cacheKey := "ls:" + strconv.Itoa(repo.RefsVersion) + ":" + strings.Join(lines, "|")
 			if cached, hit := gitCacheGet(repo, cacheKey); hit {
 				store.Mu.RUnlock()
 				return gitBufferResponse(200, "application/x-git-upload-pack-result", cached)
@@ -1829,9 +2035,11 @@ func gitHandleReceivePack(store *Store, repo *Repo, body []byte) gitResponse {
 	}
 	var parsed *gitPackReadResult
 	if len(packBytes) > 0 {
-		store.Mu.RLock()
-		p, err := gitParsePack(packBytes, lookup, true)
-		store.Mu.RUnlock()
+		p, err := func() (*gitPackReadResult, error) {
+			store.Mu.RLock()
+			defer store.Mu.RUnlock()
+			return gitParsePack(packBytes, lookup, true)
+		}()
 		if err != nil {
 			return gitReceiveReport(err.Error(), nil)
 		}
@@ -1883,6 +2091,7 @@ func gitHandleReceivePack(store *Store, repo *Repo, body []byte) gitResponse {
 				reports = append(reports, gitRefReport{Ref: command.Ref, OK: false, Reason: "non-fast-forward"})
 			} else {
 				delete(repo.Refs, command.Ref)
+				repo.RefsVersion++
 				reports = append(reports, gitRefReport{Ref: command.Ref, OK: true})
 			}
 			continue
@@ -1894,6 +2103,7 @@ func gitHandleReceivePack(store *Store, repo *Repo, body []byte) gitResponse {
 				reports = append(reports, gitRefReport{Ref: command.Ref, OK: false, Reason: "object not found"})
 			} else {
 				repo.Refs[command.Ref] = command.NewOID
+				repo.RefsVersion++
 				reports = append(reports, gitRefReport{Ref: command.Ref, OK: true})
 			}
 			continue
@@ -1910,6 +2120,7 @@ func gitHandleReceivePack(store *Store, repo *Repo, body []byte) gitResponse {
 			return gitJSONResponse(500, err.Error())
 		} else if ff {
 			repo.Refs[command.Ref] = command.NewOID
+			repo.RefsVersion++
 			reports = append(reports, gitRefReport{Ref: command.Ref, OK: true})
 		} else {
 			reports = append(reports, gitRefReport{Ref: command.Ref, OK: false, Reason: "non-fast-forward"})

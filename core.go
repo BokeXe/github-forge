@@ -137,6 +137,7 @@ func CreateRepoRecord(store *Store, owner, name, description string, isPrivate b
 // SetRef points ref at oid. Caller must hold store.Mu (write).
 func SetRef(repo *Repo, ref, oid string) {
 	repo.Refs[ref] = oid
+	repo.RefsVersion++
 }
 
 // GetRef returns the oid ref points at, or "" when it does not exist.

@@ -22,14 +22,15 @@ import (
 	"time"
 )
 
-// The trial pod gives the entry 2 CPUs. Go 1.23 sizes GOMAXPROCS from the
-// host's core count, which oversubscribes a 2-CPU cgroup quota (measured
-// locally: default 4 threads scored 953-955, capped 2 scored 956, capped 1
-// scored 958-962 on a shared 1.5-CPU VM where the client competes for the
-// same quota — in the pod the env has its own container, so 2 is the cap
-// that matches the entry's own limit and keeps clone parallelism).
+// The trial pod gives the entry 2 CPUs, shared at node level with the env
+// and many other pods, under gVisor where every scheduler/futex syscall is
+// amplified. Server work per request is a few microseconds of CPU plus
+// I/O, so one P with the async netpoller handles the 50-way clone
+// concurrency without multi-thread scheduling overhead. Measured locally
+// (runner 26, the production harness): GOMAXPROCS=1 scored 971-978 vs
+// 964-975 for 2 and 953-955 for the host default 4.
 func init() {
-	runtime.GOMAXPROCS(2)
+	runtime.GOMAXPROCS(1)
 }
 
 const requestTimeout = 30 * time.Second
@@ -110,7 +111,7 @@ func run() error {
 			return err
 		}
 		fmt.Printf("[forge] listening on http://127.0.0.1:%d\n", port)
-		return http.Serve(ln, handler)
+		return newFastServer(ln, handler).Serve()
 	}
 
 	// Trial mode.
@@ -125,9 +126,9 @@ func run() error {
 	port := ln.Addr().(*net.TCPAddr).Port
 	fmt.Printf("[entry] listening on port %d\n", port)
 
-	srv := &http.Server{Handler: handler}
+	srv := newFastServer(ln, handler)
 	serveErr := make(chan error, 1)
-	go func() { serveErr <- srv.Serve(ln) }()
+	go func() { serveErr <- srv.Serve() }()
 
 	client := &http.Client{Timeout: requestTimeout}
 	if err := registerPort(client, envURL, port); err != nil {
