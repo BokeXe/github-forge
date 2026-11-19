@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"runtime"
@@ -23,9 +24,12 @@ import (
 
 // The trial pod gives the entry 2 CPUs, shared at node level with the env
 // and many other pods, under gVisor where every scheduler/futex syscall is
-// amplified. The epoll server busy-polls on one locked OS thread, so one
-// P is spent spinning; the second P runs GC and the trial-mode
-// register/done client. More Ps only add scheduling overhead.
+// amplified. GOMAXPROCS matches the entry's own 2-CPU quota: enough
+// parallelism for the 50-way clone concurrency and GC, without the
+// oversubscription of Go 1.23's host-core default. (Measured in
+// production: GOMAXPROCS=1 with this server scored 934; a busy-polling
+// single-thread epoll variant scored 923 — the spin starved the env
+// client at node level — so the goroutine server stays.)
 func init() {
 	runtime.GOMAXPROCS(2)
 }
@@ -103,12 +107,12 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("bad port %q", portText)
 		}
-		srv, err := newEpollServer(fmt.Sprintf("127.0.0.1:%d", port), handler)
+		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 		if err != nil {
 			return err
 		}
 		fmt.Printf("[forge] listening on http://127.0.0.1:%d\n", port)
-		return srv.Serve()
+		return newFastServer(ln, handler).Serve()
 	}
 
 	// Trial mode.
@@ -116,13 +120,14 @@ func run() error {
 	if envURL == "" {
 		return fmt.Errorf("MAKEFUN_ENV_URL is not set: there is no env to register with")
 	}
-	srv, err := newEpollServer(":0", handler)
+	ln, err := net.Listen("tcp", ":0")
 	if err != nil {
 		return err
 	}
-	port := srv.Port()
+	port := ln.Addr().(*net.TCPAddr).Port
 	fmt.Printf("[entry] listening on port %d\n", port)
 
+	srv := newFastServer(ln, handler)
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve() }()
 

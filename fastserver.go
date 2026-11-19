@@ -86,6 +86,30 @@ func (s *fastServer) Serve() error {
 
 var errBadRequest = errors.New("bad request")
 
+// parseRequestTarget parses an origin-form request target. The common
+// case (plain ASCII path, optional query, no escapes or fragment) is
+// split by hand; anything else goes through net/url so escaped paths
+// and absolute-form targets behave exactly as net/http would parse
+// them.
+func parseRequestTarget(target string) (*url.URL, error) {
+	if strings.HasPrefix(target, "/") && !strings.ContainsAny(target, "%#\\") {
+		u := &url.URL{}
+		if q := strings.IndexByte(target, '?'); q >= 0 {
+			u.Path = target[:q]
+			u.RawQuery = target[q+1:]
+			u.ForceQuery = q == len(target)-1
+		} else {
+			u.Path = target
+		}
+		return u, nil
+	}
+	u, err := url.ParseRequestURI(target)
+	if err != nil {
+		u, err = url.Parse(target)
+	}
+	return u, err
+}
+
 func equalFoldASCII(b []byte, s string) bool {
 	if len(b) != len(s) {
 		return false
@@ -279,14 +303,9 @@ func readFastRequest(br *bufio.Reader, continueWriter io.Writer, remoteAddr stri
 		}
 	}
 
-	u, err := url.ParseRequestURI(target)
+	u, err := parseRequestTarget(target)
 	if err != nil {
-		// Absolute-form or odd targets: fall back to a plain parse so
-		// routing still sees a path (net/http accepts absolute-form).
-		u, err = url.Parse(target)
-		if err != nil {
-			return nil, true, errBadRequest
-		}
+		return nil, true, errBadRequest
 	}
 
 	req := &http.Request{

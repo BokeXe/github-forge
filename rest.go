@@ -744,7 +744,7 @@ func tryServeCachedIssue(w http.ResponseWriter, r *http.Request, store *Store, t
 	if token == "" {
 		return false
 	}
-	if r.Header.Get("Authorization") != "Bearer "+token {
+	if !BearerHeaderMatches(r, token) {
 		return false
 	}
 	if r.URL.ForceQuery || r.URL.RawQuery != "" {
@@ -754,12 +754,27 @@ func tryServeCachedIssue(w http.ResponseWriter, r *http.Request, store *Store, t
 	if !strings.HasPrefix(path, "/api/v3/repos/") {
 		return false
 	}
-	parts := strings.Split(path[len("/api/v3/repos/"):], "/")
-	if len(parts) != 4 || parts[2] != "issues" {
+	rest := path[len("/api/v3/repos/"):]
+	// Manual segment scan: {owner}/{repo}/issues/{n} with no further
+	// slashes — avoids the Split slice allocation on the read hot path.
+	s1 := strings.IndexByte(rest, '/')
+	if s1 <= 0 {
 		return false
 	}
-	owner, name, numStr := parts[0], parts[1], parts[3]
-	if owner == "" || name == "" || !isAllDigits(numStr) {
+	owner := rest[:s1]
+	rest = rest[s1+1:]
+	s2 := strings.IndexByte(rest, '/')
+	if s2 <= 0 {
+		return false
+	}
+	name := rest[:s2]
+	rest = rest[s2+1:]
+	s3 := strings.IndexByte(rest, '/')
+	if s3 < 0 || rest[:s3] != "issues" {
+		return false
+	}
+	numStr := rest[s3+1:]
+	if numStr == "" || strings.IndexByte(numStr, '/') >= 0 || !isAllDigits(numStr) {
 		return false
 	}
 	if strings.Contains(owner, "%") || strings.Contains(name, "%") {

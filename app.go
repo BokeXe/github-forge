@@ -49,6 +49,7 @@ func appPathOf(r *http.Request) string {
 // unset, local dev only); the env var is fixed for the life of the process.
 func NewApp(store *Store) http.Handler {
 	token := os.Getenv("MAKEFUN_SHOP_TOKEN")
+	SetBearerHeader(token)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := appPathOf(r)
 

@@ -466,6 +466,24 @@ func BearerToken(r *http.Request) (string, bool) {
 	return strings.TrimSpace(rest), true
 }
 
+// bearerHeaderValue is "Bearer <token>" computed once at startup (the
+// token is fixed for the life of the process), so hot auth checks are a
+// single string compare instead of a concatenation per request.
+var bearerHeaderValue string
+
+func SetBearerHeader(token string) {
+	if token != "" {
+		bearerHeaderValue = "Bearer " + token
+	}
+}
+
+func BearerHeaderMatches(r *http.Request, token string) bool {
+	if bearerHeaderValue != "" {
+		return r.Header.Get("Authorization") == bearerHeaderValue
+	}
+	return r.Header.Get("Authorization") == "Bearer "+token
+}
+
 // IsAuthorized is true when the request carries exactly the token.
 func IsAuthorized(r *http.Request, token string) bool {
 	if token == "" {

@@ -1619,7 +1619,7 @@ func gitAuthorised(r *http.Request, token string) bool {
 	if token == "" {
 		return true // no token configured (local dev): do not lock the door on nothing
 	}
-	return r.Header.Get("Authorization") == "Bearer "+token
+	return BearerHeaderMatches(r, token)
 }
 
 func gitWantsV2(r *http.Request) bool {
