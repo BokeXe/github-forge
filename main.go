@@ -13,7 +13,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"runtime"
@@ -24,13 +23,11 @@ import (
 
 // The trial pod gives the entry 2 CPUs, shared at node level with the env
 // and many other pods, under gVisor where every scheduler/futex syscall is
-// amplified. Server work per request is a few microseconds of CPU plus
-// I/O, so one P with the async netpoller handles the 50-way clone
-// concurrency without multi-thread scheduling overhead. Measured locally
-// (runner 26, the production harness): GOMAXPROCS=1 scored 971-978 vs
-// 964-975 for 2 and 953-955 for the host default 4.
+// amplified. The epoll server busy-polls on one locked OS thread, so one
+// P is spent spinning; the second P runs GC and the trial-mode
+// register/done client. More Ps only add scheduling overhead.
 func init() {
-	runtime.GOMAXPROCS(1)
+	runtime.GOMAXPROCS(2)
 }
 
 const requestTimeout = 30 * time.Second
@@ -106,12 +103,12 @@ func run() error {
 		if err != nil {
 			return fmt.Errorf("bad port %q", portText)
 		}
-		ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+		srv, err := newEpollServer(fmt.Sprintf("127.0.0.1:%d", port), handler)
 		if err != nil {
 			return err
 		}
 		fmt.Printf("[forge] listening on http://127.0.0.1:%d\n", port)
-		return newFastServer(ln, handler).Serve()
+		return srv.Serve()
 	}
 
 	// Trial mode.
@@ -119,14 +116,13 @@ func run() error {
 	if envURL == "" {
 		return fmt.Errorf("MAKEFUN_ENV_URL is not set: there is no env to register with")
 	}
-	ln, err := net.Listen("tcp", ":0")
+	srv, err := newEpollServer(":0", handler)
 	if err != nil {
 		return err
 	}
-	port := ln.Addr().(*net.TCPAddr).Port
+	port := srv.Port()
 	fmt.Printf("[entry] listening on port %d\n", port)
 
-	srv := newFastServer(ln, handler)
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve() }()
 

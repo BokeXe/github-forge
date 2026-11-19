@@ -134,7 +134,7 @@ func (s *fastServer) serveConn(conn net.Conn) {
 	br.Reset(conn)
 	defer fastReaderPool.Put(br)
 	for {
-		req, closeAfter, err := readFastRequest(br, conn)
+		req, closeAfter, err := readFastRequest(br, conn, conn.RemoteAddr().String())
 		if err != nil {
 			if err == errBadRequest {
 				io.WriteString(conn, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
@@ -155,7 +155,7 @@ func (s *fastServer) serveConn(conn net.Conn) {
 	}
 }
 
-func readFastRequest(br *bufio.Reader, conn net.Conn) (*http.Request, bool, error) {
+func readFastRequest(br *bufio.Reader, continueWriter io.Writer, remoteAddr string) (*http.Request, bool, error) {
 	// Skip any stray blank lines before the request line (net/http does).
 	var line []byte
 	for {
@@ -245,7 +245,7 @@ func readFastRequest(br *bufio.Reader, conn net.Conn) (*http.Request, bool, erro
 	}
 
 	if expectContinue {
-		if _, err := io.WriteString(conn, "HTTP/1.1 100 Continue\r\n\r\n"); err != nil {
+		if _, err := io.WriteString(continueWriter, "HTTP/1.1 100 Continue\r\n\r\n"); err != nil {
 			return nil, true, err
 		}
 	}
@@ -300,7 +300,7 @@ func readFastRequest(br *bufio.Reader, conn net.Conn) (*http.Request, bool, erro
 		ContentLength: contentLength,
 		Host:          host,
 		RequestURI:    target,
-		RemoteAddr:    conn.RemoteAddr().String(),
+		RemoteAddr:    remoteAddr,
 		Close:         closeAfter,
 	}
 	if http10 {
@@ -393,6 +393,11 @@ func (w *fastResponseWriter) Write(p []byte) (int, error) {
 }
 
 func (w *fastResponseWriter) writeTo(conn net.Conn, method string) error {
+	_, err := conn.Write(w.bytes(method))
+	return err
+}
+
+func (w *fastResponseWriter) bytes(method string) []byte {
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
@@ -424,6 +429,5 @@ func (w *fastResponseWriter) writeTo(conn net.Conn, method string) error {
 	if method != http.MethodHead && w.status != http.StatusNoContent {
 		out.Write(w.body.Bytes())
 	}
-	_, err := conn.Write(out.Bytes())
-	return err
+	return out.Bytes()
 }
