@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"time"
@@ -32,6 +33,14 @@ import (
 // client at node level — so the goroutine server stays.)
 func init() {
 	runtime.GOMAXPROCS(2)
+	// GC tuning (v3 experiment E1/E5): a trial is short (900 s wall,
+	// the benchmark phase ~seconds of work) and the pod has 1024 MiB.
+	// GC pauses and background GC CPU compete with the suite client,
+	// so collect rarely (400% heap growth) with a soft memory limit
+	// (768 MiB) as the ceiling. Pure GOGC=off was measured worse
+	// locally in an earlier iteration, so it is not used.
+	debug.SetGCPercent(400)
+	debug.SetMemoryLimit(768 << 20)
 }
 
 const requestTimeout = 30 * time.Second
@@ -112,7 +121,7 @@ func run() error {
 			return err
 		}
 		fmt.Printf("[forge] listening on http://127.0.0.1:%d\n", port)
-		return newFastServer(ln, handler).Serve()
+		return serveReactor(ln, handler)
 	}
 
 	// Trial mode.
@@ -127,7 +136,17 @@ func run() error {
 	port := ln.Addr().(*net.TCPAddr).Port
 	fmt.Printf("[entry] listening on port %d\n", port)
 
-	srv := newFastServer(ln, handler)
+	var srv interface {
+		Serve() error
+		Close() error
+	}
+	if os.Getenv("FORGE_SERVER") == "goroutine" {
+		srv = newFastServer(ln, handler)
+	} else if r, err := newReactor(ln, handler); err == nil {
+		srv = r
+	} else {
+		srv = newFastServer(ln, handler)
+	}
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve() }()
 

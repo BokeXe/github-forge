@@ -1187,6 +1187,45 @@ func gitCachePut(store *Store, repo *Repo, key string, buf []byte) {
 	repo.PackCache[key] = buf
 }
 
+// gitCachedResponse returns the cached response for key, generating it
+// (under the read lock, via gen) on a miss. Concurrent identical misses
+// coalesce: the first caller generates, the rest wait for its result —
+// the clone workload fires 50 identical fetches at once, and without
+// this all 50 walk and deflate the same pack. gen runs with store.Mu
+// read-held and must only read the repo.
+func gitCachedResponse(store *Store, repo *Repo, key string, gen func() ([]byte, error)) ([]byte, error) {
+	callKey := RepoKey(repo.Owner, repo.Name) + "\x00" + key
+	for {
+		store.Mu.RLock()
+		if cached, hit := gitCacheGet(repo, key); hit {
+			store.Mu.RUnlock()
+			return cached, nil
+		}
+		store.FetchMu.Lock()
+		call, flying := store.FetchCalls[callKey]
+		if !flying {
+			call = &FetchCall{Done: make(chan struct{})}
+			store.FetchCalls[callKey] = call
+		}
+		store.FetchMu.Unlock()
+		if flying {
+			store.Mu.RUnlock()
+			<-call.Done
+			continue
+		}
+		buf, err := gen()
+		store.Mu.RUnlock()
+		if err == nil {
+			gitCachePut(store, repo, key, buf)
+		}
+		store.FetchMu.Lock()
+		delete(store.FetchCalls, callKey)
+		store.FetchMu.Unlock()
+		close(call.Done)
+		return buf, err
+	}
+}
+
 // gitDecodePacketsUntilFlush decodes pkt-lines from the start of buffer. It
 // stops at the first flush packet and reports how many bytes were consumed,
 // so a caller can treat the rest as raw data (receive-pack's pack). ok is
@@ -1814,38 +1853,28 @@ func gitHandleUploadPack(r *http.Request, store *Store, repo *Repo, body []byte)
 	if strings.HasPrefix(first, "command=") {
 		command := strings.TrimSpace(strings.TrimSuffix(first[len("command="):], "\n"))
 		if command == "ls-refs" {
-			store.Mu.RLock()
 			cacheKey := "ls:" + strconv.Itoa(repo.RefsVersion) + ":" + strings.Join(lines, "|")
-			if cached, hit := gitCacheGet(repo, cacheKey); hit {
-				store.Mu.RUnlock()
-				return gitBufferResponse(200, "application/x-git-upload-pack-result", cached)
-			}
-			buf, err := gitLsRefsResponse(repo, lines)
-			store.Mu.RUnlock()
+			buf, err := gitCachedResponse(store, repo, cacheKey, func() ([]byte, error) {
+				return gitLsRefsResponse(repo, lines)
+			})
 			if err != nil {
 				return gitJSONResponse(500, err.Error())
 			}
-			gitCachePut(store, repo, cacheKey, buf)
 			return gitBufferResponse(200, "application/x-git-upload-pack-result", buf)
 		}
 		if command == "fetch" {
 			args := gitParseFetchArgs(lines)
 			cacheKey := gitFetchCacheKey("2", args)
-			store.Mu.RLock()
-			if cached, hit := gitCacheGet(repo, cacheKey); hit {
-				store.Mu.RUnlock()
-				return gitBufferResponse(200, "application/x-git-upload-pack-result", cached)
-			}
-			plan, err := gitPlanFetch(repo, args.Wants, args.Haves, args.Shallow, args.Depth)
-			var buf []byte
-			if err == nil {
-				buf, err = gitV2FetchResponse(plan)
-			}
-			store.Mu.RUnlock()
+			buf, err := gitCachedResponse(store, repo, cacheKey, func() ([]byte, error) {
+				plan, err := gitPlanFetch(repo, args.Wants, args.Haves, args.Shallow, args.Depth)
+				if err != nil {
+					return nil, err
+				}
+				return gitV2FetchResponse(plan)
+			})
 			if err != nil {
 				return gitJSONResponse(500, err.Error())
 			}
-			gitCachePut(store, repo, cacheKey, buf)
 			return gitBufferResponse(200, "application/x-git-upload-pack-result", buf)
 		}
 		return gitJSONResponse(400, "unknown command "+command)
@@ -1857,21 +1886,16 @@ func gitHandleUploadPack(r *http.Request, store *Store, repo *Repo, body []byte)
 	// v0 fetch: want/have/done lines in two flush-separated sections.
 	args := gitParseFetchArgs(lines)
 	cacheKey := gitFetchCacheKey("0", args)
-	store.Mu.RLock()
-	if cached, hit := gitCacheGet(repo, cacheKey); hit {
-		store.Mu.RUnlock()
-		return gitBufferResponse(200, "application/x-git-upload-pack-result", cached)
-	}
-	plan, err := gitPlanFetch(repo, args.Wants, args.Haves, args.Shallow, args.Depth)
-	var buf []byte
-	if err == nil {
-		buf, err = gitV0FetchResponse(plan)
-	}
-	store.Mu.RUnlock()
+	buf, err := gitCachedResponse(store, repo, cacheKey, func() ([]byte, error) {
+		plan, err := gitPlanFetch(repo, args.Wants, args.Haves, args.Shallow, args.Depth)
+		if err != nil {
+			return nil, err
+		}
+		return gitV0FetchResponse(plan)
+	})
 	if err != nil {
 		return gitJSONResponse(500, err.Error())
 	}
-	gitCachePut(store, repo, cacheKey, buf)
 	return gitBufferResponse(200, "application/x-git-upload-pack-result", buf)
 }
 

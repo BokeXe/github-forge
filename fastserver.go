@@ -86,14 +86,14 @@ func (s *fastServer) Serve() error {
 
 var errBadRequest = errors.New("bad request")
 
-// parseRequestTarget parses an origin-form request target. The common
-// case (plain ASCII path, optional query, no escapes or fragment) is
-// split by hand; anything else goes through net/url so escaped paths
-// and absolute-form targets behave exactly as net/http would parse
-// them.
-func parseRequestTarget(target string) (*url.URL, error) {
+// parseRequestTargetInto parses an origin-form request target into u.
+// The common case (plain ASCII path, optional query, no escapes or
+// fragment) is split by hand; anything else goes through net/url so
+// escaped paths and absolute-form targets behave exactly as net/http
+// would parse them.
+func parseRequestTargetInto(u *url.URL, target string) error {
+	*u = url.URL{}
 	if strings.HasPrefix(target, "/") && !strings.ContainsAny(target, "%#\\") {
-		u := &url.URL{}
 		if q := strings.IndexByte(target, '?'); q >= 0 {
 			u.Path = target[:q]
 			u.RawQuery = target[q+1:]
@@ -101,13 +101,17 @@ func parseRequestTarget(target string) (*url.URL, error) {
 		} else {
 			u.Path = target
 		}
-		return u, nil
+		return nil
 	}
-	u, err := url.ParseRequestURI(target)
+	parsed, err := url.ParseRequestURI(target)
 	if err != nil {
-		u, err = url.Parse(target)
+		parsed, err = url.Parse(target)
 	}
-	return u, err
+	if err != nil {
+		return err
+	}
+	*u = *parsed
+	return nil
 }
 
 func equalFoldASCII(b []byte, s string) bool {
@@ -157,8 +161,9 @@ func (s *fastServer) serveConn(conn net.Conn) {
 	br := fastReaderPool.Get().(*bufio.Reader)
 	br.Reset(conn)
 	defer fastReaderPool.Put(br)
+	remoteAddr := conn.RemoteAddr().String()
 	for {
-		req, closeAfter, err := readFastRequest(br, conn, conn.RemoteAddr().String())
+		req, closeAfter, err := readFastRequest(br, conn, remoteAddr)
 		if err != nil {
 			if err == errBadRequest {
 				io.WriteString(conn, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
@@ -170,6 +175,7 @@ func (s *fastServer) serveConn(conn net.Conn) {
 		s.handler.ServeHTTP(rw, req)
 		err = rw.writeTo(conn, req.Method)
 		fastWriterPool.Put(rw)
+		putFastRequest(req)
 		if err != nil {
 			return
 		}
@@ -178,6 +184,43 @@ func (s *fastServer) serveConn(conn net.Conn) {
 		}
 	}
 }
+
+// Pooled request objects: the read workload is 2,000 sequential requests
+// on one connection, and a fresh http.Request + Header map + url.URL +
+// body slice per request is pure GC churn (and, with GC off, heap
+// growth). Handlers consume the request synchronously, so the objects
+// return to the pool as soon as the response is written.
+var fastRequestPool = sync.Pool{
+	New: func() any {
+		return &http.Request{Header: make(http.Header, 4), URL: &url.URL{}}
+	},
+}
+
+var fastBodyPool = sync.Pool{
+	New: func() any { return make([]byte, 0, 4096) },
+}
+
+func putFastRequest(req *http.Request) {
+	if req == nil {
+		return
+	}
+	if bb, ok := req.Body.(*fastBodyReader); ok && bb.buf != nil {
+		fastBodyPool.Put(bb.buf[:0])
+	}
+	for k := range req.Header {
+		delete(req.Header, k)
+	}
+	*req.URL = url.URL{}
+	*req = http.Request{Header: req.Header, URL: req.URL}
+	fastRequestPool.Put(req)
+}
+
+type fastBodyReader struct {
+	*bytes.Reader
+	buf []byte
+}
+
+func (r *fastBodyReader) Close() error { return nil }
 
 func readFastRequest(br *bufio.Reader, continueWriter io.Writer, remoteAddr string) (*http.Request, bool, error) {
 	// Skip any stray blank lines before the request line (net/http does).
@@ -210,7 +253,8 @@ func readFastRequest(br *bufio.Reader, continueWriter io.Writer, remoteAddr stri
 	}
 	http10 := proto == "HTTP/1.0"
 
-	header := make(http.Header, 4)
+	req := fastRequestPool.Get().(*http.Request)
+	header := req.Header
 	contentLength := int64(-1)
 	chunked := false
 	expectContinue := false
@@ -219,6 +263,7 @@ func readFastRequest(br *bufio.Reader, continueWriter io.Writer, remoteAddr stri
 	for {
 		hl, err := readLine(br)
 		if err != nil {
+			putFastRequest(req)
 			return nil, true, err
 		}
 		if len(hl) == 0 {
@@ -226,6 +271,7 @@ func readFastRequest(br *bufio.Reader, continueWriter io.Writer, remoteAddr stri
 		}
 		colon := bytes.IndexByte(hl, ':')
 		if colon <= 0 {
+			putFastRequest(req)
 			return nil, true, errBadRequest
 		}
 		rawKey := hl[:colon]
@@ -270,15 +316,18 @@ func readFastRequest(br *bufio.Reader, continueWriter io.Writer, remoteAddr stri
 
 	if expectContinue {
 		if _, err := io.WriteString(continueWriter, "HTTP/1.1 100 Continue\r\n\r\n"); err != nil {
+			putFastRequest(req)
 			return nil, true, err
 		}
 	}
 
 	var body []byte
+	var pooledBody []byte
 	if chunked {
 		var err error
 		body, err = readChunkedBody(br)
 		if err != nil {
+			putFastRequest(req)
 			return nil, true, err
 		}
 		contentLength = int64(len(body))
@@ -287,8 +336,16 @@ func readFastRequest(br *bufio.Reader, continueWriter io.Writer, remoteAddr stri
 		if readLen > fastMaxBody {
 			readLen = fastMaxBody
 		}
-		body = make([]byte, readLen)
+		pooledBody = fastBodyPool.Get().([]byte)
+		if int64(cap(pooledBody)) < readLen {
+			pooledBody = make([]byte, readLen)
+		} else {
+			pooledBody = pooledBody[:readLen]
+		}
+		body = pooledBody
 		if _, err := io.ReadFull(br, body); err != nil {
+			fastBodyPool.Put(pooledBody[:0])
+			putFastRequest(req)
 			return nil, true, err
 		}
 		if contentLength > fastMaxBody {
@@ -303,25 +360,24 @@ func readFastRequest(br *bufio.Reader, continueWriter io.Writer, remoteAddr stri
 		}
 	}
 
-	u, err := parseRequestTarget(target)
-	if err != nil {
+	if err := parseRequestTargetInto(req.URL, target); err != nil {
+		if pooledBody != nil {
+			fastBodyPool.Put(pooledBody[:0])
+		}
+		putFastRequest(req)
 		return nil, true, errBadRequest
 	}
 
-	req := &http.Request{
-		Method:        method,
-		URL:           u,
-		Proto:         proto,
-		ProtoMajor:    1,
-		ProtoMinor:    1,
-		Header:        header,
-		Body:          io.NopCloser(bytes.NewReader(body)),
-		ContentLength: contentLength,
-		Host:          host,
-		RequestURI:    target,
-		RemoteAddr:    remoteAddr,
-		Close:         closeAfter,
-	}
+	req.Method = method
+	req.Proto = proto
+	req.ProtoMajor = 1
+	req.ProtoMinor = 1
+	req.Body = &fastBodyReader{Reader: bytes.NewReader(body), buf: pooledBody}
+	req.ContentLength = contentLength
+	req.Host = host
+	req.RequestURI = target
+	req.RemoteAddr = remoteAddr
+	req.Close = closeAfter
 	if http10 {
 		req.ProtoMinor = 0
 	}
@@ -385,12 +441,14 @@ func (w *fastResponseWriter) reset() {
 	w.status = 0
 	w.wroteHeader = false
 	w.body.Reset()
+	w.out = w.out[:0]
 }
 
 type fastResponseWriter struct {
 	header      http.Header
 	status      int
 	body        bytes.Buffer
+	out         []byte
 	wroteHeader bool
 }
 
@@ -420,33 +478,36 @@ func (w *fastResponseWriter) bytes(method string) []byte {
 	if !w.wroteHeader {
 		w.WriteHeader(http.StatusOK)
 	}
-	var out bytes.Buffer
-	out.Grow(w.body.Len() + 256)
-	out.WriteString("HTTP/1.1 ")
-	out.WriteString(strconv.Itoa(w.status))
-	out.WriteByte(' ')
-	out.WriteString(http.StatusText(w.status))
-	out.WriteString("\r\n")
+	out := w.out[:0]
+	if cap(out) < w.body.Len()+256 {
+		out = make([]byte, 0, w.body.Len()+256)
+	}
+	out = append(out, "HTTP/1.1 "...)
+	out = strconv.AppendInt(out, int64(w.status), 10)
+	out = append(out, ' ')
+	out = append(out, http.StatusText(w.status)...)
+	out = append(out, "\r\n"...)
 	hasCL := false
 	for key, values := range w.header {
 		if strings.EqualFold(key, "Content-Length") {
 			hasCL = true
 		}
 		for _, v := range values {
-			out.WriteString(key)
-			out.WriteString(": ")
-			out.WriteString(v)
-			out.WriteString("\r\n")
+			out = append(out, key...)
+			out = append(out, ": "...)
+			out = append(out, v...)
+			out = append(out, "\r\n"...)
 		}
 	}
 	if !hasCL && w.status != http.StatusNoContent && w.status != http.StatusNotModified {
-		out.WriteString("Content-Length: ")
-		out.WriteString(strconv.Itoa(w.body.Len()))
-		out.WriteString("\r\n")
+		out = append(out, "Content-Length: "...)
+		out = strconv.AppendInt(out, int64(w.body.Len()), 10)
+		out = append(out, "\r\n"...)
 	}
-	out.WriteString("\r\n")
+	out = append(out, "\r\n"...)
 	if method != http.MethodHead && w.status != http.StatusNoContent {
-		out.Write(w.body.Bytes())
+		out = append(out, w.body.Bytes()...)
 	}
-	return out.Bytes()
+	w.out = out
+	return out
 }

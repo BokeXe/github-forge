@@ -118,6 +118,16 @@ type Store struct {
 	Mu       sync.RWMutex
 	Repos    map[string]*Repo
 	NextDBID int
+
+	// In-flight fetch-response generations, for stampede coalescing:
+	// 50 concurrent identical clones share one pack generation.
+	FetchMu    sync.Mutex
+	FetchCalls map[string]*FetchCall
+}
+
+// FetchCall is one in-flight cached-response generation.
+type FetchCall struct {
+	Done chan struct{}
 }
 
 // RepoKey joins owner and name unambiguously.
@@ -125,7 +135,7 @@ func RepoKey(owner, name string) string { return owner + "/" + name }
 
 // NewStore builds an empty store.
 func NewStore() *Store {
-	return &Store{Repos: make(map[string]*Repo), NextDBID: 10000}
+	return &Store{Repos: make(map[string]*Repo), NextDBID: 10000, FetchCalls: make(map[string]*FetchCall)}
 }
 
 // GetRepo returns the repo or nil. Caller must hold Mu (read or write).
